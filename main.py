@@ -16,11 +16,14 @@ from datetime import datetime
 
 SOLRAY_ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SOLRAY_ROOT, "config.json")
-# Render uses this path when a persistent disk is configured.
-# Local runs fallback to a folder named "לקוחות" in the app directory.
-OUTPUT_DIR = os.environ.get("PERSISTENT_STORAGE_PATH", os.path.join(SOLRAY_ROOT, "לקוחות"))
+OUTPUT_DIR = os.environ.get('PERSISTENT_STORAGE_PATH', os.path.join(os.getcwd(), 'לקוחות'))
+
+# יצירת התיקייה רק אם זה לא הנתיב של הדיסק הקבוע (שנוצר אוטומטית)
 if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+    except OSError as e:
+        print(f"Note: Could not create directory {OUTPUT_DIR}: {e}")
 TEMPLATE_LETTER = "לכבוד דייר.docx"
 TEMPLATE_QUOTE = "פורמט הצעת מחיר.docx"
 LOGO_NAMES = ("לוגו.png", "לוגו.jpg")
