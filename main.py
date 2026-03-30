@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Solray Mobile – Solar proposal app.
-Generates two documents from templates:
-A) מכתב_פתיחה_[ClientName].docx  from "לכבוד דייר.docx"
-B) הצעת מחיר [ClientName].docx   from "פורמט הצעת מחיר.docx"
+Generates one Word file: page 1 = opening letter (from "לכבוד דייר.docx"),
+page 2 = price quote (from "פורמט הצעת מחיר.docx"), merged with a page break.
 
 Form inputs: representative, client_name, address, city, roof_sqm, price_per_kw.
 Output saved to: <this folder>/לקוחות/<client_name>/
@@ -719,39 +718,24 @@ def process_quote_template(
     return out_path
 
 
+def merge_letter_and_quote(letter_path, quote_path, output_path):
+    """
+    Single document: first page(s) = letter, then page break, then quote.
+    Uses docxcompose so images and relationships stay valid.
+    """
+    from docx import Document
+    from docxcompose.composer import Composer
+
+    master = Document(letter_path)
+    master.add_page_break()
+    composer = Composer(master)
+    composer.append(Document(quote_path))
+    composer.save(output_path)
+
+
 # ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
-
-def convert_to_pdf(docx_path):
-    """
-    Convert a DOCX file to PDF. Returns the PDF path on success, or None.
-    Tries docx2pdf (uses Microsoft Word) first, then LibreOffice as fallback.
-    """
-    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
-    # Primary: docx2pdf (requires MS Word on macOS/Windows)
-    try:
-        from docx2pdf import convert
-        convert(docx_path, pdf_path)
-        if os.path.isfile(pdf_path):
-            return pdf_path
-    except Exception:
-        pass
-    # Fallback: LibreOffice headless
-    try:
-        import subprocess
-        out_dir = os.path.dirname(docx_path)
-        r = subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf",
-             "--outdir", out_dir, docx_path],
-            capture_output=True, timeout=60,
-        )
-        if r.returncode == 0 and os.path.isfile(pdf_path):
-            return pdf_path
-    except Exception:
-        pass
-    return None
-
 
 def create_app():
     from flask import Flask, render_template_string, request, redirect, url_for, send_file
@@ -812,11 +796,10 @@ def create_app():
 <body>
   <h1>סול-ריי – הצעת מחיר</h1>
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
-  {% if letter_url and quote_url %}
+  {% if document_url %}
   <div class="success-box">
-    <p>המסמכים נוצרו בהצלחה! (הצעה מס׳ {{ quote_number }})</p>
-    <a class="dl-btn dl-letter" href="{{ letter_url }}" download>הורד מכתב פתיחה</a>
-    <a class="dl-btn dl-quote"  href="{{ quote_url }}"  download>הורד הצעת מחיר</a>
+    <p>המסמך נוצר בהצלחה! (הצעה מס׳ {{ quote_number }}) — דף ראשון: מכתב פתיחה, דף שני: הצעת מחיר</p>
+    <a class="dl-btn dl-letter" href="{{ document_url }}" download>הורד מסמך Word</a>
   </div>
   {% endif %}
   <form method="post" action="{{ url_for('generate') }}">
@@ -981,8 +964,7 @@ def create_app():
             prefill_client=request.args.get("client", ""),
             prefill_address=request.args.get("address", ""),
             error=request.args.get("error"),
-            letter_url=request.args.get("letter_url"),
-            quote_url=request.args.get("quote_url"),
+            document_url=request.args.get("document_url"),
             quote_number=request.args.get("quote_number", ""),
         )
 
@@ -1093,6 +1075,19 @@ def create_app():
         except Exception as e:
             return redirect(url_for("index", error="שגיאה בעיבוד: {}".format(e)))
 
+        combined_name = "מכתב_פתיחה_והצעת_מחיר_{}.docx".format(client_name)
+        combined_path = os.path.join(client_folder, combined_name)
+        try:
+            merge_letter_and_quote(letter_path, quote_path, combined_path)
+        except Exception as e:
+            return redirect(url_for("index", error="שגיאה באיחוד המסמכים: {}".format(e)))
+
+        try:
+            os.remove(letter_path)
+            os.remove(quote_path)
+        except OSError:
+            pass
+
         quote_number += 1
         save_config({
             "representative": representative,
@@ -1102,16 +1097,13 @@ def create_app():
             "quote_number": quote_number,
         })
 
-        # Build relative paths for download route (relative to OUTPUT_DIR)
-        letter_rel = os.path.relpath(letter_path, OUTPUT_DIR)
-        quote_rel = os.path.relpath(quote_path, OUTPUT_DIR)
+        combined_rel = os.path.relpath(combined_path, OUTPUT_DIR)
 
         return redirect(url_for(
             "index",
             client=client_name,
             address=address,
-            letter_url=url_for("download", filename=letter_rel),
-            quote_url=url_for("download", filename=quote_rel),
+            document_url=url_for("download", filename=combined_rel),
             quote_number=quote_number - 1,
         ))
 
