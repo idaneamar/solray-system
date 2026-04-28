@@ -50,10 +50,6 @@ SIZING_TIERS = [
     (80, 15, 18), (110, 20, 24), (150, 30, 36), (190, 40, 48), (240, 45, 54), (295, 50, 60),
 ]
 
-HEBREW_MONTHS = [
-    "ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני",
-    "יולי", "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר", "דצמבר",
-]
 
 DEFAULT_CONFIG = {
     "representative": "רון הלל",
@@ -154,7 +150,7 @@ def blended_avg_per_kw(yearly_rev, inverter_kw):
 
 def hebrew_date():
     now = datetime.now()
-    return "{} ב{} {}".format(now.day, HEBREW_MONTHS[now.month - 1], now.year)
+    return "{:02d}/{:02d}/{}".format(now.day, now.month, now.year)
 
 
 # ---------------------------------------------------------------------------
