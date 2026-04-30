@@ -585,7 +585,9 @@ def process_quote_template(
             parent = parent.getparent()
         return False
 
-    def _fill_box_in(root):
+    def _fill_all_boxes_in(root):
+        """Fill ALL text boxes in root whose text matches the header placeholder."""
+        filled = 0
         for elem in root.iter():
             if elem.tag != _W_P:
                 continue
@@ -599,16 +601,17 @@ def process_quote_template(
                     t_nodes[0].text = header_line_text
                     for t in t_nodes[1:]:
                         t.text = ""
-                return True
-        return False
+                filled += 1
+        return filled
 
-    if not _fill_box_in(doc.element.body):
+    filled_count = _fill_all_boxes_in(doc.element.body)
+    if not filled_count:
         for _sec in doc.sections:
             for _part in (_sec.header, _sec.footer,
                           getattr(_sec, "first_page_header", None),
                           getattr(_sec, "first_page_footer", None)):
-                if _part is not None and _fill_box_in(_part._element):
-                    break
+                if _part is not None:
+                    _fill_all_boxes_in(_part._element)
 
     # Fix floating text-box positions so neither box overlaps the orange strips.
     # Both anchors are currently paragraph-relative; we pin them to fixed page
@@ -718,14 +721,37 @@ def merge_letter_and_quote(letter_path, quote_path, output_path):
     """
     Single document: first page(s) = letter, then page break, then quote.
     Uses docxcompose so images and relationships stay valid.
+    After composing, replaces the merged footer/header with the quote's
+    footer/header so that the orange design, QR code, and contact info
+    (which live in the quote's footer part) appear on every page.
     """
+    import copy
     from docx import Document
     from docxcompose.composer import Composer
+
+    # Load the quote document first to capture its footer/header XML
+    quote_doc = Document(quote_path)
+    quote_footer_xml = copy.deepcopy(quote_doc.sections[0].footer._element)
+    quote_header_xml = copy.deepcopy(quote_doc.sections[0].header._element)
 
     master = Document(letter_path)
     master.add_page_break()
     composer = Composer(master)
     composer.append(Document(quote_path))
+
+    # Replace footer of the merged document with the quote's footer
+    # (the quote footer contains the orange design, QR code, and contact info)
+    merged_footer = master.sections[0].footer._element
+    merged_footer.clear()
+    for child in list(quote_footer_xml):
+        merged_footer.append(copy.deepcopy(child))
+
+    # Replace header of the merged document with the quote's header
+    merged_header = master.sections[0].header._element
+    merged_header.clear()
+    for child in list(quote_header_xml):
+        merged_header.append(copy.deepcopy(child))
+
     composer.save(output_path)
 
 
