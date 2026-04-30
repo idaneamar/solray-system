@@ -24,7 +24,7 @@ if not os.path.exists(OUTPUT_DIR):
     except OSError as e:
         print(f"Note: Could not create directory {OUTPUT_DIR}: {e}")
 TEMPLATE_LETTER = "לכבוד דייר.docx"
-TEMPLATE_QUOTE = "פורמט הצעת מחיר - מעוצב.docx"
+TEMPLATE_QUOTE = "פורמט הצעת מחיר.docx"
 LOGO_NAMES = ("לוגו.png", "לוגו.jpg")
 
 REPRESENTATIVES = [
@@ -303,23 +303,18 @@ def process_quote_template(
     extra_items=None,
 ):
     """
-    Fill "פורמט הצעת מחיר - מעוצב.docx".
-    Template tables:
-      0 – title bar (no changes)
-      1 – 2×2 client/date/address/quote# (each cell: bold label + value paragraph)
-      2 – 1×3 with nested tables: col0 = property data, col2 = income calculation
-      3 – pricing: header row + solar data row + extra item rows + total row
-      4 – signature (no changes)
+    Fill "פורמט הצעת מחיר.docx":
+      - "לכבוד" fields and header bar  → client_name
+      - "כתובת" field and table-0 row-1 → address
+    Save as "הצעת מחיר [client_name].docx" in output_folder_path.
     """
-    import copy
     from docx import Document
-    from docx.shared import Inches
-    from docx.oxml.ns import qn
-    from lxml import etree as _et
+    from docx.shared import Inches, Pt
+    from docx.dml.color import RGBColor
 
     template_path = os.path.join(SOLRAY_ROOT, TEMPLATE_QUOTE)
     if not os.path.isfile(template_path):
-        raise FileNotFoundError("קובץ המקור '{}' חסר בתקיית מערכת לסלולר".format(TEMPLATE_QUOTE))
+        raise FileNotFoundError("קובץ המקור 'פורמט הצעת מחיר.docx' חסר בתקיית מערכת לסלולר")
 
     doc = Document(template_path)
 
@@ -330,9 +325,9 @@ def process_quote_template(
         if os.path.isfile(p):
             logo_path = p
             break
+    section = doc.sections[0]
+    header = section.header
     if logo_path:
-        section = doc.sections[0]
-        header = section.header
         header_para = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
         header_para.clear()
         header_para.alignment = 0
@@ -342,97 +337,376 @@ def process_quote_template(
     def fmt_num(x):
         return "{:,.0f}".format(round(x))
 
-    _W_TBL = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tbl"
-    _W_TR  = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr"
-    _W_TC  = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc"
-    _W_T   = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
-    _W_P   = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
-    _W_R   = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}r"
+    # Label → value mapping.
+    # client_name fills "לכבוד" fields; address fills "כתובת" fields.
+    # Longer labels listed first to avoid partial matches.
+    label_to_value = [
+        ("סה״כ כולל מע״מ",             "₪ " + fmt_num(total_after_vat)),
+        ("סה״כ לתשלום",                "₪ " + fmt_num(total_after_vat)),
+        ("סה״כ הכנסה שנתית בשח",       "₪ " + fmt_num(yearly_rev)),
+        ("סה״כ הכנסה שנתית משוערת",    "₪ " + fmt_num(yearly_rev)),
+        ("סה״כ הכנסה שנתית משוערת ₪",  "₪ " + fmt_num(yearly_rev)),
+        ("הכנסה שנתית משוערת",         "₪ " + fmt_num(yearly_rev)),
+        ("כמות שעות שמש שנתיות",        "1650"),
+        ("סה״כ קילוואט מותקן",         str(installed_kw)),
+        ("תמחור ממוצע לקילוואט",        blended_avg),
+        ("מחיר ליחידה ב ₪",            "₪ " + fmt_num(price_per_kw)),
+        ("מחיר ליחידה בשח",            "₪ " + fmt_num(price_per_kw)),
+        ("מחיר ליחידה בש״ח",           "₪ " + fmt_num(price_per_kw)),
+        ("פרמיה אורבנית",              "כן" if urban_premium else "לא"),
+        ("גודל הממיר",                 str(inverter_kw)),
+        ("גודל הגג",                   str(roof_sqm)),
+        ("לכבוד:",                     client_name),
+        ("לכבוד",                      client_name),
+        ("הצעת מחיר",                  str(quote_number)),
+        ("תאריך",                      hebrew_date()),
+        ("כתובת",                      address),
+        ("כמות",                       str(installed_kw)),
+        ("סה״כ",                       "₪ " + fmt_num(total_before_vat)),
+        ("18%",                        "₪ " + fmt_num(vat)),
+        ("מע״מ 18%",                   "₪ " + fmt_num(vat)),
+        ("מע״מ",                       "₪ " + fmt_num(vat)),
+        ("עיר",                        city),
+        ("עיר:",                       city),
+    ]
+    label_set = {label for label, _ in label_to_value}
 
-    def _set_nested_cell(tc_elem, value):
-        """Set text of a raw <w:tc> element (handles nested table cells)."""
-        t_nodes = list(tc_elem.iter(_W_T))
-        if t_nodes:
-            t_nodes[0].text = str(value)
-            for t in t_nodes[1:]:
-                t.text = ""
-        else:
-            p = tc_elem.find(_W_P)
-            if p is None:
-                p = _et.SubElement(tc_elem, _W_P)
-            r = _et.SubElement(p, _W_R)
-            t = _et.SubElement(r, _W_T)
-            t.text = str(value)
+    header_line_text = "לכבוד: {}   הצעת מחיר {}   תאריך {}".format(
+        client_name, quote_number, hebrew_date()
+    )
 
-    def _set_value_para(cell, value):
-        """Set value in paragraph[1] of a cell (blank line after the bold label)."""
-        para = cell.paragraphs[1] if len(cell.paragraphs) >= 2 else cell.paragraphs[0]
-        para.clear()
-        para.add_run(str(value))
+    HEADER_TITLE_FONT_SIZE = Pt(14)
+    HEADER_TITLE_COLOR = RGBColor(0xE8, 0x5D, 0x04)
 
-    # --- Table 1: proposal details ---
-    t1 = doc.tables[1]
-    _set_value_para(t1.rows[0].cells[0], client_name)        # שם הלקוח
-    _set_value_para(t1.rows[0].cells[1], hebrew_date())      # תאריך
-    _set_value_para(t1.rows[1].cells[0], address)            # כתובת הנכס
-    _set_value_para(t1.rows[1].cells[1], str(quote_number))  # מספר הצעה
+    def _format_header_title_run(run):
+        run.font.size = HEADER_TITLE_FONT_SIZE
+        run.font.color.rgb = HEADER_TITLE_COLOR
 
-    # --- Table 2: nested property + income tables ---
-    t2 = doc.tables[2]
-    t2_tcs = t2.rows[0]._tr.findall(_W_TC)
+    def _format_header_title_in_cell(cell):
+        if cell.paragraphs and cell.paragraphs[0].runs:
+            _format_header_title_run(cell.paragraphs[0].runs[0])
 
-    prop_tbl = t2_tcs[0].find(_W_TBL)
-    if prop_tbl is not None:
-        prop_rows = prop_tbl.findall(_W_TR)
-        # row0 = header "נתוני הנכס", rows 1-4 = data
-        for i, val in enumerate([address, str(roof_sqm), str(inverter_kw), str(installed_kw)]):
-            ri = i + 1
-            if ri < len(prop_rows):
-                tc_list = prop_rows[ri].findall(_W_TC)
-                if len(tc_list) >= 2:
-                    _set_nested_cell(tc_list[1], val)
+    def _is_pricing_table(table):
+        for row in table.rows:
+            row_text = " ".join(_cell_text(c) for c in row.cells)
+            if "מחיר ליחידה" in row_text and "כמות" in row_text:
+                return True
+            if "מע״מ" in row_text and "18%" in row_text:
+                return True
+        return False
 
-    inc_tbl = t2_tcs[2].find(_W_TBL)
-    if inc_tbl is not None:
-        inc_rows = inc_tbl.findall(_W_TR)
-        # row0 = header, row1=עיר, row2=פרמיה, row3=תמחור ממוצע, row4=שעות (skip), row5=הכנסה
-        for ri, val in {
-            1: city,
-            2: "כן" if urban_premium else "לא",
-            3: blended_avg,
-            5: "₪ " + fmt_num(yearly_rev),
-        }.items():
-            if ri < len(inc_rows):
-                tc_list = inc_rows[ri].findall(_W_TC)
-                if len(tc_list) >= 2:
-                    _set_nested_cell(tc_list[1], val)
+    def fill_pricing_table(table):
+        import copy
+        from docx.oxml.ns import qn
 
-    # --- Table 3: pricing ---
-    t3 = doc.tables[3]
-    solar_total = installed_kw * price_per_kw
+        header_row_idx = None
+        for ri, row in enumerate(table.rows):
+            row_text = " ".join(_cell_text(c) for c in row.cells)
+            if "מחיר ליחידה" in row_text and "כמות" in row_text:
+                header_row_idx = ri
+                break
+        if header_row_idx is None:
+            return
+        header_row = table.rows[header_row_idx]
+        data_row_idx = header_row_idx + 1
+        if data_row_idx >= len(table.rows):
+            return
+        data_row = table.rows[data_row_idx]
+        header_cells = header_row.cells
+        data_cells = data_row.cells
+        nc = min(len(header_cells), len(data_cells))
 
-    # Row 1: solar system (col0 = description label already in template)
-    solar_cells = t3.rows[1].cells
-    _set_cell_value(solar_cells[1], "₪ " + fmt_num(price_per_kw))
-    _set_cell_value(solar_cells[2], str(installed_kw))
-    _set_cell_value(solar_cells[3], "₪ " + fmt_num(solar_total))
+        col_desc = col_qty = col_price = col_total = None
+        for col in range(nc):
+            text = _cell_text(header_cells[col]).strip()
+            if "מחיר ליחידה" in text:
+                col_price = col
+            elif text == "כמות":
+                col_qty = col
+            elif text == "סה״כ" or (
+                text.startswith("סה") and "כ" in text
+                and "קילוואט" not in text and "הכנסה" not in text
+            ):
+                col_total = col
+            elif "פירוט" in text or "תיאור" in text or "מוצר" in text:
+                col_desc = col
 
-    # Extra item rows inserted after solar row, before total row
-    for i, item in enumerate(extra_items or []):
-        src_row = t3.rows[1 + i]
-        new_tr = copy.deepcopy(src_row._tr)
-        for t_elem in new_tr.iter(qn("w:t")):
-            t_elem.text = ""
-        src_row._tr.addnext(new_tr)
-        new_cells = t3.rows[2 + i].cells
-        _set_cell_value(new_cells[0], item["desc"])
-        _set_cell_value(new_cells[1], "₪ " + fmt_num(item["price"]))
-        qty_val = item["qty"]
-        _set_cell_value(new_cells[2], str(int(qty_val)) if qty_val == int(qty_val) else str(qty_val))
-        _set_cell_value(new_cells[3], "₪ " + fmt_num(item["total"]))
+        solar_total = installed_kw * price_per_kw
+        if col_price is not None:
+            _set_cell_value(data_cells[col_price], "₪ " + fmt_num(price_per_kw))
+        if col_qty is not None:
+            _set_cell_value(data_cells[col_qty], str(installed_kw))
+        if col_total is not None:
+            _set_cell_value(data_cells[col_total], "₪ " + fmt_num(solar_total))
 
-    # Total row (last row, orange): col3 = total before VAT
-    _set_cell_value(t3.rows[-1].cells[3], "₪ " + fmt_num(total_before_vat))
+        items = extra_items or []
+        for i, item in enumerate(items):
+            src_row = table.rows[data_row_idx + i]
+            new_tr = copy.deepcopy(src_row._tr)
+            for t_elem in new_tr.iter(qn("w:t")):
+                t_elem.text = ""
+            src_row._tr.addnext(new_tr)
+            new_row = table.rows[data_row_idx + i + 1]
+            new_cells = new_row.cells
+            if col_desc is not None and col_desc < len(new_cells):
+                _set_cell_value(new_cells[col_desc], item["desc"])
+            elif col_price is not None and col_price < len(new_cells):
+                _set_cell_value(new_cells[col_price], item["desc"])
+            if col_qty is not None and col_qty < len(new_cells):
+                qty_val = item["qty"]
+                _set_cell_value(new_cells[col_qty], str(int(qty_val)) if qty_val == int(qty_val) else str(qty_val))
+            if col_price is not None and col_price < len(new_cells):
+                _set_cell_value(new_cells[col_price], "₪ " + fmt_num(item["price"]))
+            if col_total is not None and col_total < len(new_cells):
+                _set_cell_value(new_cells[col_total], "₪ " + fmt_num(item["total"]))
+
+        vat_row_idx = None
+        for ri in range(data_row_idx + 1, len(table.rows)):
+            row = table.rows[ri]
+            cells = row.cells
+            row_text = " ".join(_cell_text(c) for c in cells)
+            if "מע״מ" in row_text or "18%" in row_text:
+                vat_row_idx = ri
+                for idx, c in enumerate(cells):
+                    if _cell_text(c).strip() in ("18%", "מע״מ"):
+                        if col_total is not None and col_total < len(cells):
+                            _set_cell_value(cells[col_total], "₪ " + fmt_num(vat))
+                        elif idx > 0:
+                            _set_cell_value(cells[idx - 1], "₪ " + fmt_num(vat))
+                        elif idx < len(cells) - 1:
+                            _set_cell_value(cells[idx + 1], "₪ " + fmt_num(vat))
+                        break
+                break
+
+        if col_total is not None and vat_row_idx is not None and vat_row_idx + 1 < len(table.rows):
+            grand_total_row = table.rows[vat_row_idx + 1]
+            if col_total < len(grand_total_row.cells):
+                _set_cell_value(grand_total_row.cells[col_total], "₪ " + fmt_num(total_after_vat))
+
+        for ri in range(header_row_idx + 1, len(table.rows)):
+            row = table.rows[ri]
+            cells = row.cells
+            for idx, c in enumerate(cells):
+                text = _cell_text(c)
+                if "סה״כ כולל" in text or "סה״כ לתשלום" in text:
+                    if idx > 0 and "₪" not in _cell_text(cells[idx - 1]):
+                        _set_cell_value(cells[idx - 1], "₪ " + fmt_num(total_after_vat))
+                    elif idx < len(cells) - 1:
+                        _set_cell_value(cells[idx + 1], "₪ " + fmt_num(total_after_vat))
+                    break
+
+    def fill_tables(tables, value_to_right=False):
+        for table in tables:
+            if _is_pricing_table(table):
+                fill_pricing_table(table)
+                continue
+            for row in table.rows:
+                cells = row.cells
+                for idx, cell in enumerate(cells):
+                    text = _cell_text(cell)
+                    if not text:
+                        continue
+                    for label, value in label_to_value:
+                        if label not in text and text.strip() != label:
+                            continue
+                        if value_to_right:
+                            target_idx = idx + 1 if idx < len(cells) - 1 else idx - 1
+                        else:
+                            target_idx = idx - 1 if idx > 0 else (idx + 1 if idx < len(cells) - 1 else idx)
+                        if target_idx < 0 or target_idx >= len(cells):
+                            break
+                        target_cell = cells[target_idx]
+                        if _cell_text(target_cell).strip() in label_set:
+                            break
+                        _set_cell_value(target_cell, value)
+                        break
+
+    # Table 0 (merged property+income) is filled purely by positional code below.
+    # Run label-based fill only on subsequent tables (pricing etc.).
+    fill_tables(doc.tables[1:])
+
+    # Positional fill for the combined property+income table (table 0).
+    # Table layout (RTL, columns numbered right→left visually = index 0→N in memory):
+    #   col 0: property labels  | col 1: property values  | col 2: spacer
+    #   col 3: income labels    | col 4: income values
+    tables = doc.tables
+    if len(tables) >= 1:
+        t0 = tables[0]
+        if len(t0.rows) >= 5:
+            prop_val_col = 1
+            _set_cell_value(t0.rows[1].cells[prop_val_col], address)
+            _set_cell_value(t0.rows[2].cells[prop_val_col], str(roof_sqm))
+            _set_cell_value(t0.rows[3].cells[prop_val_col], str(inverter_kw))
+            _set_cell_value(t0.rows[4].cells[prop_val_col], str(installed_kw))
+            income_val_col = 4
+            income_values = [
+                city,
+                "כן" if urban_premium else "לא",
+                blended_avg,
+                "1650",
+                "₪ " + fmt_num(yearly_rev),
+            ]
+            for i, val in enumerate(income_values):
+                ri = i + 1
+                if ri < len(t0.rows) and len(t0.rows[ri].cells) > income_val_col:
+                    _set_cell_value(t0.rows[ri].cells[income_val_col], val)
+
+    # Clear any placeholder text in the page header.
+    # The header line now lives in the "כאן תכניס את הכותרת" text box in the body.
+    _CLEAR_KEYWORDS = ("לכבוד", "הצעת מחיר", "תאריך", "כאן", "כותרת")
+    for _sec in doc.sections:
+        for _hpart in (_sec.header, getattr(_sec, "first_page_header", None)):
+            if _hpart is None:
+                continue
+            if hasattr(_hpart, "tables"):
+                for _tbl in _hpart.tables:
+                    for _row in _tbl.rows:
+                        for _cell in _row.cells:
+                            if any(kw in _cell_text(_cell) for kw in _CLEAR_KEYWORDS):
+                                _set_cell_value(_cell, "")
+            if hasattr(_hpart, "paragraphs"):
+                for _para in _hpart.paragraphs:
+                    _pt = "".join(r.text or "" for r in _para.runs)
+                    if any(kw in _pt for kw in _CLEAR_KEYWORDS):
+                        _para.clear()
+
+    # Fill text box / rectangle labelled "כאן תכניס את הכותרת" with header line.
+    # Searches entire document (body, headers, footers) for a paragraph inside a
+    # txbxContent element whose text matches the placeholder.
+    _W_T = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
+    _W_P = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
+
+    def _in_textbox(elem):
+        parent = elem.getparent()
+        while parent is not None:
+            local = parent.tag.split("}")[-1] if "}" in parent.tag else parent.tag
+            if local == "txbxContent":
+                return True
+            parent = parent.getparent()
+        return False
+
+    def _fill_box_in(root):
+        for elem in root.iter():
+            if elem.tag != _W_P:
+                continue
+            if not _in_textbox(elem):
+                continue
+            texts = [e.text or "" for e in elem.iter() if e.tag == _W_T]
+            full = "".join(texts)
+            if "כאן תכניס את הכותרת" in full or ("תכניס" in full and "כותרת" in full):
+                t_nodes = [e for e in elem.iter() if e.tag == _W_T]
+                if t_nodes:
+                    t_nodes[0].text = header_line_text
+                    for t in t_nodes[1:]:
+                        t.text = ""
+                return True
+        return False
+
+    if not _fill_box_in(doc.element.body):
+        for _sec in doc.sections:
+            for _part in (_sec.header, _sec.footer,
+                          getattr(_sec, "first_page_header", None),
+                          getattr(_sec, "first_page_footer", None)):
+                if _part is not None and _fill_box_in(_part._element):
+                    break
+
+    # Fix floating text-box positions so neither box overlaps the orange strips.
+    # Both anchors are currently paragraph-relative; we pin them to fixed page
+    # positions so document-content changes can't push them into the header/footer.
+    _WP_NS  = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    _WP_ANC = "{%s}anchor"    % _WP_NS
+    _WP_PV  = "{%s}positionV" % _WP_NS
+    _WP_OFF = "{%s}posOffset" % _WP_NS
+    _WP_EXT = "{%s}extent"    % _WP_NS
+
+    def _pin_anchor_y(anchor, y_emu):
+        """Re-anchor a floating shape to a fixed page-relative Y position."""
+        from lxml import etree as _et
+        pv = anchor.find(_WP_PV)
+        if pv is None:
+            return
+        pv.set("relativeFrom", "page")
+        off = pv.find(_WP_OFF)
+        if off is None:
+            off = _et.SubElement(pv, _WP_OFF)
+        off.text = str(int(y_emu))
+
+    _all_anchors = list(doc.element.body.iter(_WP_ANC))
+    if _all_anchors:
+        _s       = doc.sections[0]
+        _pad     = int(914400 * 0.4 / 2.54)          # 0.4 cm in EMU
+        _top_m   = int(_s.top_margin)
+        _bot_m   = int(_s.bottom_margin)
+        _page_h  = int(_s.page_height)
+
+        # Anchor 0 – header text box: place below the orange strip (needs extra clearance)
+        _header_pad = int(914400 * 1.5 / 2.54)   # 1.5 cm in EMU
+        _pin_anchor_y(_all_anchors[0], _top_m + _header_pad)
+
+        # Anchor 1 – notes text box: place so its bottom clears the footer strip
+        if len(_all_anchors) >= 2:
+            _ext = _all_anchors[1].find(_WP_EXT)
+            _box_h = int(_ext.get("cy", "0")) if _ext is not None else 0
+            _notes_y = _page_h - _bot_m - _pad - _box_h
+            _pin_anchor_y(_all_anchors[1], max(_notes_y, _top_m + _pad))
+
+    _apply_document_font(doc, "Times New Roman", 14)
+
+    # --- Merged table (table 0): full-width autofit, 14pt TNR, centered, single-line rows ---
+    # Text-box font left at template defaults so the header rectangle keeps its position.
+    if doc.tables:
+        from docx.oxml.ns import qn as _qn
+        from docx.oxml import OxmlElement as _OE
+        from docx.shared import Pt as _Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH as _WDA
+
+        _t0 = doc.tables[0]
+
+        # 1. Set table to span full usable page width
+        _sec = doc.sections[0]
+        _usable = int(_sec.page_width - _sec.left_margin - _sec.right_margin)
+        _tblPr = _t0._tbl.find(_qn("w:tblPr"))
+        if _tblPr is None:
+            _tblPr = _OE("w:tblPr")
+            _t0._tbl.insert(0, _tblPr)
+        _tblW = _tblPr.find(_qn("w:tblW"))
+        if _tblW is None:
+            _tblW = _OE("w:tblW")
+            _tblPr.append(_tblW)
+        _tblW.set(_qn("w:w"), str(_usable))
+        _tblW.set(_qn("w:type"), "dxa")
+
+        # 2. Switch to autofit layout so Word distributes columns to content
+        _t0.autofit = True
+
+        # 3. Per-cell: release fixed width, add noWrap, apply font + alignment
+        _ncols = max((len(r.cells) for r in _t0.rows), default=1)
+        _cell_w = str(_usable // _ncols)
+        for _row in _t0.rows:
+            for _cell in _row.cells:
+                _tc = _cell._tc
+                _tcPr = _tc.find(_qn("w:tcPr"))
+                if _tcPr is None:
+                    _tcPr = _OE("w:tcPr")
+                    _tc.insert(0, _tcPr)
+                # Replace fixed width with proportional share of full table width
+                _tcW = _tcPr.find(_qn("w:tcW"))
+                if _tcW is None:
+                    _tcW = _OE("w:tcW")
+                    _tcPr.append(_tcW)
+                _tcW.set(_qn("w:w"), _cell_w)
+                _tcW.set(_qn("w:type"), "dxa")
+                # noWrap: prevent content from expanding row height
+                if _tcPr.find(_qn("w:noWrap")) is None:
+                    _tcPr.append(_OE("w:noWrap"))
+                # 14pt, centered, zero paragraph spacing
+                for _p in _cell.paragraphs:
+                    _p.alignment = _WDA.CENTER
+                    _p.paragraph_format.space_before = _Pt(0)
+                    _p.paragraph_format.space_after  = _Pt(0)
+                    for _run in _p.runs:
+                        _run.font.name = "Times New Roman"
+                        _run.font.size = _Pt(14)
 
     out_name = "הצעת מחיר {}.docx".format(client_name)
     out_path = os.path.join(output_folder_path, out_name)
